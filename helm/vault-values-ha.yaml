@@ -1,0 +1,132 @@
+# vault-values-ha.yaml
+# Helm values for a 3-node Vault Enterprise HA cluster on a full OCP/ROSA cluster.
+#
+# Requirements:
+#   - cluster-admin or sufficient RBAC to create ClusterRoleBindings
+#   - StorageClass with dynamic provisioning (gp3-csi, thin-csi, etc.)
+#   - Resource quota: ~1 CPU / 1 GB RAM per pod (3 pods = 3 CPU / 3 GB total)
+#
+# Usage:
+#   helm install vault hashicorp/vault \
+#     --namespace vault \
+#     -f helm/vault-values-ha.yaml
+#
+# NOT suitable for the Red Hat Developer Sandbox. Use vault-values.yaml there.
+#
+# STORAGE CLASS
+#   ROSA / AWS:       gp3-csi (or gp2-csi)
+#   OpenShift Local:  crc-csi-hostpath-provisioner
+#   OCP on VMware:    thin-csi
+#   SNO / bare-metal: lvms-vg1
+# Edit server.dataStorage.storageClass below to match your cluster.
+
+global:
+  enabled: true
+  tlsDisable: true
+  openshift: true
+
+injector:
+  # Disabled — requires ClusterRoleBinding and MutatingWebhookConfiguration
+  # which are cluster-scoped and forbidden on the Developer Sandbox.
+  enabled: false
+
+server:
+  authDelegator:
+    # Disabled — binds to system:auth-delegator (cluster-scoped, forbidden on Sandbox).
+    enabled: false
+
+  image:
+    repository: "docker.io/hashicorp/vault-enterprise"
+    tag: "1.19-ent"
+    pullPolicy: IfNotPresent
+
+  extraEnvironmentVars:
+    VAULT_LICENSE_PATH: /vault/license/vault-license/license.txt
+
+  extraVolumes:
+    - type: secret
+      name: vault-license
+      path: /vault/license
+
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204"
+    # Allow 5 minutes for unseal before marking unready (60s x 5 = 300s)
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 30
+
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true"
+    # Don't kill the pod for 5 minutes after start — enough time to unseal
+    initialDelaySeconds: 300
+    periodSeconds: 10
+    failureThreshold: 3
+
+  standalone:
+    enabled: false
+
+  ha:
+    enabled: true
+    replicas: 3
+
+    raft:
+      enabled: true
+      setNodeId: true
+
+      config: |
+        ui = true
+
+        listener "tcp" {
+          tls_disable     = 1
+          address         = "[::]:8200"
+          cluster_address = "[::]:8201"
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+
+          retry_join {
+            leader_api_addr = "http://vault-0.vault-internal:8200"
+          }
+          retry_join {
+            leader_api_addr = "http://vault-1.vault-internal:8200"
+          }
+          retry_join {
+            leader_api_addr = "http://vault-2.vault-internal:8200"
+          }
+        }
+
+        api_addr     = "http://$(POD_IP):8200"
+        cluster_addr = "http://$(POD_IP):8201"
+
+  dataStorage:
+    enabled: true
+    size: "10Gi"
+    storageClass: null    # set to your StorageClass name, e.g. gp3-csi
+    accessMode: ReadWriteOnce
+
+  service:
+    enabled: true
+    port: 8200
+    targetPort: 8200
+
+  ui:
+    enabled: true
+    serviceType: ClusterIP

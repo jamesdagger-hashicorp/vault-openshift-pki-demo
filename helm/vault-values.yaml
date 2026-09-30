@@ -1,0 +1,146 @@
+# vault-values.yaml
+# Helm values for deploying Vault Enterprise on the Red Hat Developer Sandbox.
+#
+# This is the ACTIVE default configuration — single-node, emptyDir storage,
+# compatible with the Sandbox's restricted SCC and no cluster-scoped RBAC.
+#
+# For a 3-node HA cluster on a full OCP/ROSA cluster, use:
+#   helm install vault hashicorp/vault -f helm/vault-values-ha.yaml
+#
+# SANDBOX CONSTRAINTS ADDRESSED
+# ------------------------------
+# - injector disabled       : injector needs ClusterRoleBinding (forbidden)
+# - authDelegator disabled  : needs system:auth-delegator ClusterRoleBinding (forbidden)
+# - runAsUser: null         : chart default (100) is outside the Sandbox UID range
+# - fsGroup omitted         : Sandbox restricted-v2 SCC rejects explicit fsGroup values
+# - emptyDir storage        : WaitForFirstConsumer PVCs deadlock without a running pod
+#
+# WARNING: emptyDir is ephemeral — Vault data is lost on pod restart.
+# Re-run scripts/init-unseal.sh and vault-config/pki/*.sh after each restart.
+
+global:
+  enabled: true
+  tlsDisable: true
+  # openshift: true suppresses the chart's hardcoded runAsUser: 100 and
+  # fsGroup: 1000, allowing OpenShift to assign a UID from the project range.
+  openshift: true
+
+injector:
+  # Disabled — requires ClusterRoleBinding forbidden by the Sandbox.
+  enabled: false
+
+server:
+  # ---------------------------------------------------------------------------
+  # Auth delegator — disabled (cluster-scoped, forbidden on Sandbox)
+  # ---------------------------------------------------------------------------
+  authDelegator:
+    enabled: false
+
+  # ---------------------------------------------------------------------------
+  # Image — Vault Enterprise
+  # ---------------------------------------------------------------------------
+  image:
+    # Explicit docker.io prefix bypasses OpenShift registry mirrors that would
+    # otherwise reroute short names (e.g. hashicorp/*) through registry.connect.redhat.com.
+    repository: "docker.io/hashicorp/vault-enterprise"
+    tag: "1.19-ent"
+    pullPolicy: IfNotPresent
+
+  # ---------------------------------------------------------------------------
+  # Vault Enterprise licence
+  # ---------------------------------------------------------------------------
+  extraEnvironmentVars:
+    # The chart mounts extraVolumes at <path>/<name>/, so the file lands at:
+    # /vault/license/vault-license/license.txt
+    VAULT_LICENSE_PATH: /vault/license/vault-license/license.txt
+
+  extraVolumes:
+    - type: secret
+      name: vault-license
+      path: /vault/license
+
+  # ---------------------------------------------------------------------------
+  # Resources — sized for a single sandbox pod
+  # ---------------------------------------------------------------------------
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+  # ---------------------------------------------------------------------------
+  # Security context — compatible with OpenShift restricted-v2 SCC
+  # ---------------------------------------------------------------------------
+  # Do NOT set runAsUser or fsGroup — the Sandbox assigns a UID from the project
+  # range (e.g. 1005070000–1005079999). Explicit values outside that range cause
+  # the pod to be rejected by the SCC admission controller.
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  # ---------------------------------------------------------------------------
+  # Probes
+  # ---------------------------------------------------------------------------
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204"
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true"
+    initialDelaySeconds: 60
+
+  # ---------------------------------------------------------------------------
+  # Standalone single-node mode
+  # ---------------------------------------------------------------------------
+  standalone:
+    enabled: true
+    config: |
+      ui = true
+
+      listener "tcp" {
+        tls_disable     = 1
+        address         = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+
+      storage "raft" {
+        path    = "/vault/data"
+        node_id = "vault-0"
+      }
+
+      api_addr     = "http://$(POD_IP):8200"
+      cluster_addr = "http://$(POD_IP):8201"
+
+  ha:
+    enabled: false
+
+  # ---------------------------------------------------------------------------
+  # Storage — emptyDir (ephemeral, no PVC needed)
+  # ---------------------------------------------------------------------------
+  dataStorage:
+    enabled: false
+
+  volumes:
+    - name: vault-data
+      emptyDir: {}
+
+  volumeMounts:
+    - name: vault-data
+      mountPath: /vault/data
+
+  # ---------------------------------------------------------------------------
+  # Service and UI
+  # ---------------------------------------------------------------------------
+  service:
+    enabled: true
+    port: 8200
+    targetPort: 8200
+
+  ui:
+    enabled: true
+    serviceType: ClusterIP

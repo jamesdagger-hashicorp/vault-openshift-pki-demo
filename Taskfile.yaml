@@ -1,0 +1,224 @@
+# Taskfile.yaml
+# https://taskfile.dev
+#
+# Run `task` (no args) to see all available tasks.
+# Run `task up` to bring up the full demo end-to-end.
+#
+# Prerequisites: task, oc, helm, vault, jq, openssl CLIs on PATH.
+# Copy .env.example to .env and fill in your values before running.
+
+version: "3"
+
+dotenv:
+  - ".env"
+
+vars:
+  NAMESPACE: '{{.NAMESPACE | default "vault"}}'
+  VAULT_ADDR: '{{.VAULT_ADDR | default "http://localhost:8200"}}'
+  INIT_FILE: private/vault-init.json
+
+tasks:
+
+  # ---------------------------------------------------------------------------
+  # Default — list tasks
+  # ---------------------------------------------------------------------------
+  default:
+    desc: List all available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  # ---------------------------------------------------------------------------
+  # check — verify all required CLI tools are installed
+  # ---------------------------------------------------------------------------
+  check:
+    desc: "Verify all required CLI tools are installed and the cluster is reachable"
+    silent: true
+    cmds:
+      - |
+        PASS=true
+        check_cmd() {
+          if command -v "$1" &>/dev/null; then
+            echo "  ✔  $1  ($(command -v "$1"))"
+          else
+            echo "  ✘  $1  — NOT FOUND"
+            PASS=false
+          fi
+        }
+        echo ""
+        echo "Required CLI tools:"
+        check_cmd oc
+        check_cmd helm
+        check_cmd vault
+        check_cmd jq
+        check_cmd openssl
+        check_cmd task
+        echo ""
+
+        echo "Environment variables:"
+        check_var() {
+          local name="$1" val="$2" required="$3"
+          if [[ -n "$val" ]]; then
+            echo "  ✔  $name"
+          elif [[ "$required" == "required" ]]; then
+            echo "  ✘  $name  — NOT SET (required)"
+            PASS=false
+          else
+            echo "  ~  $name  — not set (optional)"
+          fi
+        }
+        check_var OC_SERVER   "${OC_SERVER:-}"   required
+        check_var OC_TOKEN    "${OC_TOKEN:-}"    required
+        check_var VAULT_LICENSE "${VAULT_LICENSE:-}" required
+        check_var VAULT_ADDR  "${VAULT_ADDR:-}"  optional
+        check_var VAULT_TOKEN "${VAULT_TOKEN:-}" optional
+        echo ""
+
+        echo "Cluster connectivity:"
+        if oc whoami &>/dev/null 2>&1; then
+          echo "  ✔  Connected as $(oc whoami 2>/dev/null)"
+        else
+          echo "  ~  Not connected (run: oc login --token=\$OC_TOKEN --server=\$OC_SERVER)"
+        fi
+        echo ""
+
+        if [[ "$PASS" == "true" ]]; then
+          echo "✔  All checks passed. Run 'task up' to start the demo."
+        else
+          echo "✘  Some checks failed. Resolve the issues above before continuing."
+          exit 1
+        fi
+        echo ""
+
+  # ---------------------------------------------------------------------------
+  # up — full end-to-end bring-up
+  # ---------------------------------------------------------------------------
+  up:
+    desc: "Full demo bring-up: bootstrap → init/unseal → PKI → auth → smoke test"
+    cmds:
+      - task: check
+      - task: bootstrap
+      - task: init-unseal
+      - task: pki-setup
+      - task: auth-setup
+      - task: smoke-test
+
+  # ---------------------------------------------------------------------------
+  # bootstrap — namespace, licence Secret, Helm install/upgrade
+  # ---------------------------------------------------------------------------
+  bootstrap:
+    desc: "Create namespace, licence Secret and install/upgrade Vault via Helm"
+    cmds:
+      - bash scripts/bootstrap.sh
+
+  # ---------------------------------------------------------------------------
+  # init-unseal — initialise and unseal Vault
+  # ---------------------------------------------------------------------------
+  init-unseal:
+    desc: "Initialise Vault (first run) and unseal all pods"
+    cmds:
+      - bash scripts/init-unseal.sh
+
+  # ---------------------------------------------------------------------------
+  # port-forward — expose Vault API locally on port 8200
+  # ---------------------------------------------------------------------------
+  port-forward:
+    desc: "Port-forward Vault API to localhost:8200 (run in a separate terminal)"
+    cmds:
+      - oc port-forward -n {{.NAMESPACE}} svc/vault 8200:8200
+
+  # ---------------------------------------------------------------------------
+  # pki-setup — root CA + intermediate CA + role
+  # ---------------------------------------------------------------------------
+  pki-setup:
+    desc: "Configure PKI: root CA, intermediate CA and demo-role"
+    cmds:
+      - task: pki-root-ca
+      - task: pki-intermediate-ca
+      - task: pki-role
+
+  pki-root-ca:
+    desc: "Enable PKI engine and generate root CA"
+    cmds:
+      - bash vault-config/pki/setup-root-ca.sh
+
+  pki-intermediate-ca:
+    desc: "Generate intermediate CA and sign with root CA"
+    cmds:
+      - bash vault-config/pki/setup-intermediate-ca.sh
+
+  pki-role:
+    desc: "Create PKI role demo-role and apply pki-demo policy"
+    cmds:
+      - bash vault-config/pki/setup-role.sh
+
+  # ---------------------------------------------------------------------------
+  # auth-setup — Kubernetes auth method
+  # ---------------------------------------------------------------------------
+  auth-setup:
+    desc: "Enable and configure Kubernetes auth method"
+    cmds:
+      - bash vault-config/auth/setup-kubernetes-auth.sh
+
+  # ---------------------------------------------------------------------------
+  # smoke-test — end-to-end certificate issuance test
+  # ---------------------------------------------------------------------------
+  smoke-test:
+    desc: "Issue a test certificate and validate the chain (PASS/FAIL)"
+    cmds:
+      - bash vault-config/pki/smoke-test.sh
+
+  # ---------------------------------------------------------------------------
+  # status — quick cluster and Vault health check
+  # ---------------------------------------------------------------------------
+  status:
+    desc: "Show pod status and Vault seal/HA state"
+    cmds:
+      - oc get pods -n {{.NAMESPACE}}
+      - cmd: |
+          if [[ -f "{{.INIT_FILE}}" ]]; then
+            ROOT_TOKEN=$(jq -r '.root_token' {{.INIT_FILE}})
+            VAULT_ADDR={{.VAULT_ADDR}} VAULT_TOKEN="${ROOT_TOKEN}" vault status 2>/dev/null || true
+          else
+            echo "[INFO]  Vault not yet initialised ({{.INIT_FILE}} not found)."
+          fi
+        ignore_error: true
+
+  # ---------------------------------------------------------------------------
+  # unseal — re-unseal pods after a restart (skips init)
+  # ---------------------------------------------------------------------------
+  unseal:
+    desc: "Re-unseal Vault pods after a restart (uses existing private/vault-init.json)"
+    cmds:
+      - bash scripts/init-unseal.sh
+
+  # ---------------------------------------------------------------------------
+  # teardown — uninstall Vault and delete the namespace
+  # ---------------------------------------------------------------------------
+  teardown:
+    desc: "⚠️  Uninstall Vault, delete PVCs and local init file (leaves the namespace intact)"
+    prompt: "This will uninstall Vault and DELETE all PVCs and Vault data in '{{.NAMESPACE}}'. Continue?"
+    cmds:
+      - cmd: helm uninstall {{.RELEASE_NAME | default "vault"}} --namespace {{.NAMESPACE}} 2>/dev/null || true
+        ignore_error: true
+      - cmd: oc delete pvc --all -n {{.NAMESPACE}} 2>/dev/null || true
+        ignore_error: true
+      - cmd: rm -f {{.INIT_FILE}}
+        ignore_error: true
+
+  # ---------------------------------------------------------------------------
+  # env — print resolved environment for debugging
+  # ---------------------------------------------------------------------------
+  env:
+    desc: "Print resolved environment variables (masks licence and token)"
+    silent: true
+    cmds:
+      - |
+        echo "OC_SERVER     = ${OC_SERVER:-<not set>}"
+        echo "OC_TOKEN      = ${OC_TOKEN:+***set***}${OC_TOKEN:-<not set>}"
+        echo "NAMESPACE     = {{.NAMESPACE}}"
+        echo "VAULT_LICENSE = ${VAULT_LICENSE:+***set***}${VAULT_LICENSE:-<not set>}"
+        echo "VAULT_ADDR    = {{.VAULT_ADDR}}"
+        echo "VAULT_TOKEN   = ${VAULT_TOKEN:+***set***}${VAULT_TOKEN:-<not set>}"
+        echo "RELEASE_NAME  = ${RELEASE_NAME:-vault}"
+        echo "HELM_VALUES   = ${HELM_VALUES:-helm/vault-values.yaml}"
